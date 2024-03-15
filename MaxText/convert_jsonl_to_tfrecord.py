@@ -1,75 +1,67 @@
+import os
 import json
+from google.oauth2.sts import Client
 import tensorflow as tf
 from google.cloud import storage
 
-def jsonl_to_tfrecord(gcs_jsonl_path, gcs_tfrecord_file):
+from typing import Any
+from google.api_core.page_iterator import Iterator
+from io import StringIO
+import pandas as pd
+
+def gcs_jsonl_to_tfrecord_all_files(gcs_jsonl_path: str, gcs_tfrecord_prefix: str) -> None:
+    for blob in _list_blobs(gcs_jsonl_path):
+        jsonl_text: str = blob.download_as_string().decode('utf-8')
+        jsonl_to_tfrecord(jsonl_text, _output_path(blob.name, gcs_tfrecord_prefix))
+
+
+def jsonl_to_tfrecord(jsonl_text: str, output_path: str) -> None:
+    if _gcs_path_exists(output_path):
+        print(f"Skipping {output_path} - already exists")
+        return
+
+    with tf.io.TFRecordWriter(output_path) as writer:
+        rows: list[dict[str, str]] = pd.read_json(StringIO(jsonl_text), lines=True).to_dict(orient='records')
+        for row in rows:
+            features: dict[str, tf.train.Feature] = {
+                key: tf.train.Feature(bytes_list=tf.train.BytesList(value=[value.encode('utf-8')]))
+                for key, value in row.items()
+            }
+
+            # Create an Example protocol buffer
+            example = tf.train.Example(features=tf.train.Features(feature=features))
+
+            # Write the serialized example to the TFRecord file
+            writer.write(example.SerializeToString())
+            print(".", end="")
+    print(f'Finished {output_path}')
+
+def _split_bucket_and_path(gcs_path: str) -> tuple[str, str]:
+    bucket_name, path = gcs_path.replace('gs://', '').split('/', maxsplit=1)
+    return bucket_name, path
+
+def _list_blobs(path: str) -> Iterator:
     client = storage.Client()
-    input_bucket_name, input_file_path = gcs_jsonl_path.replace('gs://', '').split('/', 1)
-    input_bucket = client.get_bucket(input_bucket_name)
-    input_blob = input_bucket.blob(input_file_path)
-    
+    bucket_name, gcs_jsonl_prefix = _split_bucket_and_path(path)
+    bucket: storage.Bucket = client.get_bucket(bucket_name)
+    return bucket.list_blobs(prefix=gcs_jsonl_prefix)
 
-    with tf.io.TFRecordWriter(gcs_tfrecord_file) as writer:
-        for line in input_blob.download_as_string().decode('utf-8').splitlines():
-            try:
-                data = json.loads(line)
-                # Create features dictionary (adjust based on your data)
-                features = {
-                                'text': tf.train.Feature(bytes_list=tf.train.BytesList(value=[data['text'].encode('utf-8')]))
-                            }
+def _output_path(jsonl_file_path: str, gcs_tfrecord_prefix: str) -> str:
+    jsonl_file_name: str = jsonl_file_path.split('/')[-1]
+    tfrecord_file_name: str = jsonl_file_name.replace('.jsonl', '.tfrecords')
+    return os.path.join(gcs_tfrecord_prefix, tfrecord_file_name)
 
-                # Create an Example protocol buffer
-                example = tf.train.Example(features=tf.train.Features(feature=features))
-
-                # Write the serialized example to the TFRecord file
-                writer.write(example.SerializeToString())
-                print("Success")
-
-            except:
-                print(f"Error in parsing {line}")
-
-
-def jsonl_to_tfrecord_all_files(gcs_jsonl_path, prefix, gcs_tfrecord_path):
+def _gcs_path_exists(path: str) -> bool:
     client = storage.Client()
-    input_bucket_name = gcs_jsonl_path.replace('gs://', '')
-    input_bucket = client.get_bucket(input_bucket_name)
-
-    input_blobs = input_bucket.list_blobs(prefix=prefix)
-
-    for input_blob in input_blobs:
-        print(input_blob.name)
-    
-        gcs_tfrecord_file = gcs_tfrecord_path+input_blob.name.split('/')[-1].replace('jsonl','tfrecords')
-        output_blob = input_bucket.blob(gcs_tfrecord_file.replace("gs://"+input_bucket_name+"/",""))
-
-        if not output_blob.exists():
-
-            with tf.io.TFRecordWriter(gcs_tfrecord_file) as writer:
-                for line in input_blob.download_as_string().decode('utf-8').splitlines():
-                    try:
-                        data = json.loads(line)
-                        # Create features dictionary (adjust based on your data)
-                        features = {
-                                        'text': tf.train.Feature(bytes_list=tf.train.BytesList(value=[data['text'].encode('utf-8')]))
-                                    }
-
-                        # Create an Example protocol buffer
-                        example = tf.train.Example(features=tf.train.Features(feature=features))
-
-                        # Write the serialized example to the TFRecord file
-                        writer.write(example.SerializeToString())
-                        print("Success")
-
-                    except:
-                        print(f"Error in parsing {line}")
-        # else:
-        #     print(f"Skipping {output_blob} because it already exists")
-
-# Usage (assuming GCS URI format)
+    bucket_name, path = _split_bucket_and_path(path)
+    bucket: storage.Bucket = client.get_bucket(bucket_name)
+    return bucket.blob(path).exists()
 
 gcs_jsonl_bucket = 'mazumdera-test-bucket'
-prefix = 'path/jsonl-data'
-tfrecord_path = 'gs://'+gcs_jsonl_bucket+'/path/tfrecord-data/' 
+prefix = 'lg/jsonl-data'
+tfrecord_dir = 'gs://'+gcs_jsonl_bucket+'/lg/tfrecord-data-carter/' 
 
-jsonl_to_tfrecord_all_files(gcs_jsonl_bucket, prefix, tfrecord_path) 
+gcs_jsonl_to_tfrecord_all_files(gcs_jsonl_path=f"gs://{gcs_jsonl_bucket}/{prefix}", gcs_tfrecord_prefix=tfrecord_dir)
+# jsonl_to_tfrecord_all_files(gcs_jsonl_bucket, prefix, tfrecord_dir) 
+
 
